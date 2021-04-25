@@ -1,0 +1,192 @@
+#!/usr/bin/env python
+
+import tf
+import time
+import math
+import rospy # module for ROS APIs
+import actionlib
+
+from geometry_msgs.msg import Twist # message type for cmd_vel
+from std_msgs.msg import Bool # message to initiate the coordination - True for yes and False for no
+from sensor_msgs.msg import LaserScan
+
+from multirobot_shapes.srv import RegistrationService, RegistrationServiceResponse
+from multirobot_shapes.msg import GoThereAction
+
+FREQUENCY = 5 # Hz
+LINEAR_VELOCITY = 0.2 # m/s
+ANGULAR_VELOCITY = math.pi / 6 # rad/s
+
+LEADER_ROBOT_NAME = 'robot_0'
+
+N = 3 # number of robots spawned = number of waypoints
+SIDE_LEN = 5 # meters - distance between each waypoint
+INIT_POSE = (0.0, 0.0, 0.0) # init pose for the shape
+INIT_ORIENT = (0.0, 0.0, 0.0, 0.0) # init orientation for the shape in quaternion
+
+LASER_ANGLE_FRONT = 0
+MIN_THRESHOLD_DISTANCE = 0.6
+
+# publisher constants
+DEFAULT_CMD_VEL_TOPIC = 'cmd_vel'
+DEFAULT_SCAN_TOPIC = 'scan'
+
+# subscriber constants
+DEFAULT_INIT_COORDINATE_TOPIC = '/%s/init_coordinate'
+
+class Follower:
+	def __init__(self, n=N, linear_velocity=LINEAR_VELOCITY, angular_velocity=ANGULAR_VELOCITY):
+		""" Constructor """
+		self.n = n
+		self.robot_name = str(rospy.get_namespace())
+		self.linear_velocity = linear_velocity
+		self.angular_velocity = angular_velocity
+		self.rate = rospy.Rate(FREQUENCY)
+
+		# Setting up publishers/subscribers
+		self._cmd_pub = rospy.Publisher(DEFAULT_CMD_VEL_TOPIC, Twist, queue_size=1)
+
+		# Setting up subscriber
+		self._laser_sub = rospy.Subscriber(DEFAULT_SCAN_TOPIC, LaserScan, self._laser_callback, queue_size=1)
+		self._init_coordinate_sub = rospy.Subscriber(DEFAULT_INIT_COORDINATE_TOPIC % LEADER_ROBOT_NAME, Bool, self._init_coordinate_callback, queue_size=1)
+
+		#other variables
+		self.init_coordinate = False
+
+		# Setting up follower's action server
+		self.action_server = actionlib.SimpleActionServer('go_there', GoThereAction, self.execute, False)
+		self.action_server.start()
+
+	def rotate_in_place(self, rotation_angle):
+		"""
+		Rotate in place the robot of rotation_angle (rad) based on fixed velocity.
+		Assumption: Counterclockwise rotation.
+		"""
+		twist_msg = Twist()
+		twist_msg.angular.z = self.angular_velocity * (1 if rotation_angle > 0 else -1)
+
+		duration = abs(rotation_angle / twist_msg.angular.z)
+
+		start_time = rospy.get_rostime()
+
+		while not rospy.is_shutdown():
+			# Check if done
+			if rospy.get_rostime() - start_time >= rospy.Duration(duration):
+				break
+
+			# Publish message.
+			self._cmd_pub.publish(twist_msg)
+
+			# Sleep to keep the set frequency.
+			self.rate.sleep()
+
+		# Rotated the required angle, stop.
+		self.stop()
+
+
+	def move_forward(self, distance):
+		"""Function to move_forward for a given distance."""
+
+		# Rate at which to operate the while loop.
+		rate = rospy.Rate(FREQUENCY)
+
+		# Setting velocities. 
+		twist_msg = Twist()
+		twist_msg.linear.x = self.linear_velocity
+		start_time = rospy.get_rostime()
+		duration = rospy.Duration(distance/twist_msg.linear.x)
+
+		start = None
+		while not rospy.is_shutdown():
+			# Check if traveled of given distance based on time.
+			if rospy.get_rostime() - start_time >= duration:
+				break
+
+			if self._close_obstacle:
+				# print "Obstacle is too close"
+				start = time.time()
+				while self._close_obstacle:
+					self.stop()
+					time.sleep(1)
+				end = time.time()
+				# print "Obstacle was too close for ", end - start
+				# print "Duration", duration
+				start_time += rospy.Duration(end - start)
+
+			self._cmd_pub.publish(twist_msg)
+
+			# Sleep to keep the set publishing frequency.
+			rate.sleep()
+
+		# Traveled the required distance, stop.
+		self.stop()
+
+	def execute(self, goal):
+		# print "I am %s and Goal I received is" % self.robot_name, goal
+
+		self.rotate_in_place(goal.angle)
+		self.move_forward(goal.dist)
+
+		self.action_server.set_succeeded()
+
+	def stop(self):
+		""" Stop the robot """
+		twist_msg = Twist()
+		self._cmd_pub.publish(twist_msg)
+
+	def _init_coordinate_callback(self, msg):
+		""" Processing of msg from the leader whch will be a boolean """
+		if msg.data == True:
+			self.init_coordinate = True
+		else:
+			self.init_coordinate = False
+
+	def _laser_callback(self, msg):
+		"""Processing of laser message."""
+		# Access to the index of the measurement in front of the robot.
+		# NOTE: assumption: the one at angle 0 corresponds to the front.
+		i = int((LASER_ANGLE_FRONT - msg.angle_min) / msg.angle_increment)
+		if msg.ranges[i] <= MIN_THRESHOLD_DISTANCE:
+			self._close_obstacle = True
+		else:
+			self._close_obstacle = False
+
+def main():
+	# Initialization of node
+	rospy.init_node("follower")
+
+	# Sleep for couple of seconds to wait for the registration
+	rospy.sleep(5)
+
+	# get the robot namespace
+	robotname = str(rospy.get_namespace())
+
+	# Instance of Leader class
+	follower_obj = Follower()
+
+	# Publish the initial position of the robot
+	# stage_pose = PoseWithCovarianceStamped()
+	# initpose_sub = rospy.Publisher(DEFAULT_INIT_POSE_TOPIC % robotname, PoseWithCovarianceStamped, queue_size=1)
+	# stage_pose.pose.position.x, stage_pose.pose.position.y, stage_pose.pose.position.z = (px, py, pz)
+	# stage_pose.pose.orientation.x, stage_pose.pose.orientation.y, stage_pose.pose.orientation.z, stage_pose.pose.orientation.w = (ox, oy, oz, ow)
+	# initpose_sub.publish(stage_pose)
+
+	# infinte loop until follower gets message from the leader that its ready for the registration process
+	while not follower_obj.init_coordinate:
+		continue
+
+	# Call the service to register itself with the leader
+	rospy.wait_for_service("/%s/registration_service" % LEADER_ROBOT_NAME)
+	srv = rospy.ServiceProxy('/%s/registration_service' % LEADER_ROBOT_NAME, RegistrationService)
+	_ = srv(robotname)
+
+	# If interrupted, send a stop command
+	rospy.on_shutdown(follower_obj.stop)
+
+	try:
+		rospy.spin()
+	except rospy.ROSInterruptException:
+		rospy.logerr("ROS node interrupted")
+
+if __name__ == "__main__":
+	main()
