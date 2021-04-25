@@ -1,0 +1,9 @@
+# Define the goal
+float32 dist # distance to move in m
+float32 angle # angle to rotate before moving 'dist' distance
+---
+# Define the result
+float32 error # Error in desired location vs actual location
+---
+# Define a feedback message
+int32 distance # Distance from the goal
