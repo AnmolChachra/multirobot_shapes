@@ -1,0 +1,91 @@
+<launch>
+  <arg name="model" default="$(env TURTLEBOT3_MODEL)" doc="model type [burger, waffle, waffle_pi]"/>
+  <arg name="first_tb3"  default="robot_0"/>
+  <arg name="second_tb3" default="robot_1"/>
+  <arg name="third_tb3"  default="robot_2"/>
+
+  <arg name="first_tb3_x_pos" default="-2.0"/>
+  <arg name="first_tb3_y_pos" default="1.0"/>
+  <arg name="first_tb3_z_pos" default="0.0"/>
+  <arg name="first_tb3_yaw"   default="0.0"/>
+
+  <arg name="first_tb3_x_orient"   default="0.0"/>
+  <arg name="first_tb3_y_orient"   default="0.0"/>
+  <arg name="first_tb3_z_orient"   default="0.0"/>
+  
+  <arg name="second_tb3_x_pos" default=" 2.0"/> <!-- world reference frame -->
+  <arg name="second_tb3_y_pos" default="1.0"/>
+  <arg name="second_tb3_z_pos" default="0.0"/>
+  <arg name="second_tb3_yaw"   default="1.57"/>
+
+  <arg name="second_tb3_x_orient"   default="0.0"/>
+  <arg name="second_tb3_y_orient"   default="0.0"/>
+  <arg name="second_tb3_z_orient"   default="1.57"/>
+
+  <arg name="third_tb3_x_pos" default="0.0"/>
+  <arg name="third_tb3_y_pos" default="2.0"/>
+  <arg name="third_tb3_z_pos" default="0.0"/>
+  <arg name="third_tb3_yaw"   default="1.57"/>
+
+  <arg name="third_tb3_x_orient"   default="0.0"/>
+  <arg name="third_tb3_y_orient"   default="0.0"/>
+  <arg name="third_tb3_z_orient"   default="1.57"/>
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name" value="$(find turtlebot3_gazebo)/worlds/empty.world"/>
+    <arg name="paused" value="false"/>
+    <arg name="use_sim_time" value="true"/>
+    <arg name="gui" value="true"/>
+    <arg name="headless" value="false"/>
+    <arg name="debug" value="false"/>
+  </include>
+
+  <group ns = "$(arg first_tb3)">
+    <param name="robot_description" command="$(find xacro)/xacro --inorder $(find turtlebot3_description)/urdf/turtlebot3_$(arg model).urdf.xacro" />
+
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher" output="screen">
+      <param name="publish_frequency" type="double" value="50.0" />
+      <param name="tf_prefix" value="$(arg first_tb3)" />
+    </node>
+    
+    <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model" args="-urdf -model $(arg first_tb3) -x $(arg first_tb3_x_pos) -y $(arg first_tb3_y_pos) -z $(arg first_tb3_z_pos) -Y $(arg first_tb3_yaw) -param robot_description" />
+
+    <node name="static_multirobot_shapes_tf_broadcaster" pkg="multirobot_shapes" type="static_multirobot_shapes_tf_broadcaster" output="screen" args="$(arg first_tb3) $(arg first_tb3_x_pos) $(arg first_tb3_y_pos) $(arg first_tb3_z_pos) $(arg first_tb3_x_orient) $(arg first_tb3_y_orient) $(arg first_tb3_z_orient)"/>
+
+    <node name="leader" pkg="multirobot_shapes" type="leader" output="screen" />
+
+  </group>
+
+  <group ns = "$(arg second_tb3)">
+    <param name="robot_description" command="$(find xacro)/xacro --inorder $(find turtlebot3_description)/urdf/turtlebot3_$(arg model).urdf.xacro" />
+
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher" output="screen">
+      <param name="publish_frequency" type="double" value="50.0" />
+      <param name="tf_prefix" value="$(arg second_tb3)" />
+    </node>
+    
+    <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model" args="-urdf -model $(arg second_tb3) -x $(arg second_tb3_x_pos) -y $(arg second_tb3_y_pos) -z $(arg second_tb3_z_pos) -Y $(arg second_tb3_yaw) -param robot_description" />
+
+    <node name="static_multirobot_shapes_tf_broadcaster" pkg="multirobot_shapes" type="static_multirobot_shapes_tf_broadcaster" output="screen" args="$(arg second_tb3) $(arg second_tb3_x_pos) $(arg second_tb3_y_pos) $(arg second_tb3_z_pos) $(arg second_tb3_x_orient) $(arg second_tb3_y_orient) $(arg second_tb3_z_orient)"/>
+
+    <node name="follower" pkg="multirobot_shapes" type="follower" output="screen" />
+
+  </group>
+
+  <group ns = "$(arg third_tb3)">
+    <param name="robot_description" command="$(find xacro)/xacro --inorder $(find turtlebot3_description)/urdf/turtlebot3_$(arg model).urdf.xacro" />
+
+    <node pkg="robot_state_publisher" type="robot_state_publisher" name="robot_state_publisher" output="screen">
+      <param name="publish_frequency" type="double" value="50.0" />
+      <param name="tf_prefix" value="$(arg third_tb3)" />
+    </node>
+    
+    <node name="spawn_urdf" pkg="gazebo_ros" type="spawn_model" args="-urdf -model $(arg third_tb3) -x $(arg third_tb3_x_pos) -y $(arg third_tb3_y_pos) -z $(arg third_tb3_z_pos) -Y $(arg third_tb3_yaw) -param robot_description" />
+
+    <node name="static_multirobot_shapes_tf_broadcaster" pkg="multirobot_shapes" type="static_multirobot_shapes_tf_broadcaster" output="screen" args="$(arg third_tb3) $(arg third_tb3_x_pos) $(arg third_tb3_y_pos) $(arg third_tb3_z_pos) $(arg third_tb3_x_orient) $(arg third_tb3_y_orient) $(arg third_tb3_z_orient)"/>
+
+    <node name="follower" pkg="multirobot_shapes" type="follower" output="screen" />
+
+  </group>
+
+</launch>
