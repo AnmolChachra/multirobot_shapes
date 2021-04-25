@@ -1,0 +1,412 @@
+#!/usr/bin/env python
+
+import tf
+import time
+import math
+import rospy
+import roslib
+import threading
+import actionlib
+
+from geometry_msgs.msg import Twist # message type for cmd_vel
+from nav_msgs.msg import Odometry # message type for position
+from geometry_msgs.msg import Pose # message type for a single waypoint
+from std_msgs.msg import Bool # message type for init_coordinate: initiate the coordination - True for yes and False for no
+from sensor_msgs.msg import LaserScan # message type for scan
+
+from multirobot_shapes.srv import RegistrationService, RegistrationServiceResponse # service to register followers
+from multirobot_shapes.msg import GoThereAction, GoThereGoal # for action client
+
+FREQUENCY = 10 # Hz
+LINEAR_VELOCITY = 0.2 # m/s
+ANGULAR_VELOCITY = math.pi / 12 # rad/s
+
+# laser constants
+LASER_ANGLE_FRONT = 0.6
+MIN_THRESHOLD_DISTANCE = 0.6
+
+# leader specific constants
+N = 3 # number of robots spawned = number of waypoints
+SIDE_LEN = 2 # meters - distance between each waypoint
+INIT_WAYPOINT_POSE = (2.0, -2.0, 0.0) # init pose for the shape
+INIT_WAYPOINT_ORIENT = (0.0, 0.0, 0.0, 0.0) # init orientation for the shape in quaternion
+
+# publisher constants
+DEFAULT_CMD_VEL_TOPIC = 'cmd_vel'
+DEFAULT_SCAN_TOPIC = 'scan'
+DEFAULT_INIT_COORDINATION_TOPIC = 'init_coordinate'
+
+# subscriber constants
+DEFAULT_ODOM_TOPIC = 'odom'
+
+class Leader:
+	def __init__(self, n=N, linear_velocity=LINEAR_VELOCITY, angular_velocity=ANGULAR_VELOCITY):
+		""" Constructor """
+		self.n = n # number of robots in the world
+		self.robot_name = str(rospy.get_namespace()) # name of the robot
+		self.linear_velocity = linear_velocity
+		self.angular_velocity = angular_velocity
+		self.rate = rospy.Rate(FREQUENCY)
+
+		# Setting up publishers/subscribers
+		self._cmd_pub = rospy.Publisher(DEFAULT_CMD_VEL_TOPIC, Twist, queue_size=1)
+		self._init_coordinate = rospy.Publisher(DEFAULT_INIT_COORDINATION_TOPIC, Bool, queue_size=1)
+
+		# Setting up the subscriber for odom
+		self._laser_sub = rospy.Subscriber(DEFAULT_SCAN_TOPIC, LaserScan, self._laser_callback, queue_size=1)
+
+		# Other variables
+		self.registered_followers = set() # set of all the followers registerd using registration_service of leader
+		self.followers_positions = {} # dict where key = <follower_name> and value = <follower_position>
+		self.followers_orientations = {} # dict where key = <follower_name> and value = <follower_orientation> (in quaternion as set by broadcaster)
+
+		# Instantiate the tf listener
+		self.listener = tf.TransformListener()
+
+
+	def set_waypoints(self, init_waypoint_pose=INIT_WAYPOINT_POSE, init_waypoint_orient=INIT_WAYPOINT_ORIENT, n=N, side_len=SIDE_LEN):
+		"""
+		Set the waypoints for the regular polygon
+		"""
+		theta = (360 / n) #outer angle of the polygon
+		rotation = theta * math.pi / 180
+
+		x, y, z = init_waypoint_pose
+		orient = tf.transformations.quaternion_from_euler(init_waypoint_orient[0], init_waypoint_orient[1], init_waypoint_orient[2])
+
+		self.waypoints_positions = [(x, y, z)] # list of tuples of (x, y, z)
+		self.waypoints_orientations = [orient] # list of tuples of euler angles (x, y, z)
+
+		for i in range(n-1):			
+			x += side_len * math.cos(rotation * i)
+			y += side_len * math.sin(rotation * i)
+
+			pose = (x, y, z)
+			orient = (0.0, 0.0, 0.0, 0.0) # orient is set as 0 for now - can be changed to point towards the center of polygon in later releases
+
+			self.waypoints_positions.append(pose)
+			self.waypoints_orientations.append(orient)
+
+	def publish_init_coordinate(self, start=False):
+		""" This publishes a bool type text on 'init_coordinate' indicating followers that leader is open for colab """
+		b = Bool()
+		b.data = start
+		self._init_coordinate.publish(b)
+
+	def rotate_in_place(self, rotation_angle):
+		"""
+		Rotate in place the robot of rotation_angle (rad) based on fixed velocity.
+		Assumption: Counterclockwise rotation.
+		"""
+		twist_msg = Twist()
+		twist_msg.angular.z = self.angular_velocity * (1 if rotation_angle > 0 else -1)
+
+		duration = abs(rotation_angle / twist_msg.angular.z)
+
+		start_time = rospy.get_rostime()
+
+		while not rospy.is_shutdown():
+			# Check if done
+			if rospy.get_rostime() - start_time >= rospy.Duration(duration):
+				break
+
+			# Publish message.
+			self._cmd_pub.publish(twist_msg)
+
+			# Sleep to keep the set frequency.
+			self.rate.sleep()
+
+		twist_msg.angular.z = 0
+		self._cmd_pub.publish(twist_msg)
+
+		# Rotated the required angle, stop.
+		self.stop()
+
+	def move_forward(self, distance):
+		"""Function to move_forward for a given distance."""
+
+		# Rate at which to operate the while loop.
+		rate = rospy.Rate(FREQUENCY)
+
+		# Setting velocities. 
+		twist_msg = Twist()
+		twist_msg.linear.x = self.linear_velocity
+		start_time = rospy.get_rostime()
+		duration = rospy.Duration(distance/twist_msg.linear.x)
+
+		start = None
+		while not rospy.is_shutdown():
+			# Check if traveled of given distance based on time.
+			if rospy.get_rostime() - start_time >= duration:
+				break
+
+			if self._close_obstacle:
+				# print "Leader says obstacle is too close"
+				start = time.time()
+				while self._close_obstacle:
+					self.stop()
+					time.sleep(1)
+				end = time.time()
+				# print "Leader says obstacle was too close for ", end - start
+				# print "Duration ", duration 
+				start_time += rospy.Duration(end - start)
+
+			self._cmd_pub.publish(twist_msg)
+
+			# Sleep to keep the set publishing frequency.
+			rate.sleep()
+
+		# Traveled the required distance, stop.
+		self.stop()
+
+	def move_to_waypoint(self, pose, orient):
+		"""
+		Given pose and orient of the waypoint, this method calculates distance and slope
+		from this node's position and orientation and then use them to move the robot
+		"""
+
+		# calculate distance between two points
+		d = ((self.position[0] - pose[0])**2 + (self.position[1] - pose[1])**2)**0.5
+
+		print "Distance calculated is ", d
+
+		# calculate the slope in radians
+		s = math.atan2(pose[1] - self.position[1], pose[0] - self.position[0])
+
+		print "Leader position is ", self.position
+		print "Waypoint postion is ", pose
+		print "Slope is ", s
+		print "Leader orientation", self.orientation
+
+		roll, pitch, yaw = tf.transformations.euler_from_quaternion(self.orientation)
+
+		print "Roll", roll
+		print "Pitch", pitch
+		print "Yaw", yaw
+
+		# handle orientation
+		yaw = s - yaw
+
+		print "Leader is going to yaw", yaw
+
+		self.rotate_in_place(yaw)
+		self.move_forward(d)
+
+	def normalize_angle(self, a):
+		return (a + math.pi) % (2 * math.pi) - math.pi
+
+	def send_goal(self, robotname, pose, orient):
+		""" 
+		Create client for given 'robotname' and send goal to it's server.
+		Goal is calculated as distance and slope angle
+		"""
+
+		client = actionlib.SimpleActionClient('/%s/go_there'%robotname, GoThereAction)
+		client.wait_for_server()
+
+		goal = GoThereGoal()
+
+		print goal
+
+		follower_position = self.followers_positions[robotname]
+		follower_orientation = self.followers_orientations[robotname]
+
+		roll, pitch, yaw = tf.transformations.euler_from_quaternion(follower_orientation)
+
+
+		dist = ((follower_position[0] - pose[0])**2 + (follower_position[1] - pose[1])**2)**0.5
+
+		angle =  math.atan2(pose[1] - follower_position[1], pose[0] - follower_position[0]) - yaw
+
+		goal.dist = dist
+		goal.angle = angle
+		
+		client.send_goal(goal)
+		client.wait_for_result(rospy.Duration.from_sec(5.0))
+
+	def set_leader_tf_from_listener(self, parent_ref_frame, child_ref_frame):
+		"""
+		Set transformation and rotation for leader using 'listener' instance
+		"""
+		try:
+			trans, rot = self.listener.lookupTransform(parent_ref_frame, child_ref_frame, rospy.Time(0))
+
+			self.position = trans
+			self.orientation = rot
+
+			# # uncomment this to verify correctness
+			# print "Leader Transformation", trans
+			# print "Leader Rotation", rot
+
+		except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+			print "Exception has occured", repr(e)
+			pass
+
+	def assign_waypoints(self):
+		"""  greedily assigns waypoints, make leader move to the waypoint, send goals to other followers"""
+
+		print "Assigning waypoints"
+
+		leader_odom_frame = self.robot_name + 'odom'
+		self.set_leader_tf_from_listener('world', leader_odom_frame) # sets self.position and self.orientation for leader robot
+
+		# create a single dictionary containing position data for all robots in the world
+		robots_positions = self.followers_positions.copy()
+		robots_positions[self.robot_name] = self.position
+
+		waypoint_robot_dict = {} # dictionary with key = waypoint idx in self.waypoints_positions
+								 # value = robot id name in self.robots_positions
+		
+		# greedily select a follower for a waypoint
+		for i, w in enumerate(self.waypoints_positions):
+			wx, wy = w[0], w[1] # get waypoint's x and y
+
+			min_distance = float("inf")
+			f_assigned = self.robot_name
+
+			for k, v in robots_positions.items():
+				if k not in waypoint_robot_dict.values():
+					px, py = v[0], v[1] # robot's x and y
+					d = ((wx - px)**2 + (wy - py)**2)**0.5
+					
+					if d < min_distance:
+						min_distance = d
+						f_assigned = k
+						
+			waypoint_robot_dict[i] = f_assigned
+
+		# inverse dictionary - key = robot_name and value = way point assigned
+		rev_waypoint_robot_dict = {v:k for k, v in waypoint_robot_dict.items()}
+
+		# make leader go to that position
+		th = threading.Thread(target=self.move_to_waypoint, args=(self.waypoints_positions[rev_waypoint_robot_dict[self.robot_name]],
+																  self.waypoints_orientations[rev_waypoint_robot_dict[self.robot_name]],))
+		th.start()
+
+		# make action client for each follower and send goal
+		for k, v in rev_waypoint_robot_dict.items():
+			if k!=self.robot_name:
+				th = threading.Thread(target=self.send_goal, args=(k, self.waypoints_positions[v], self.waypoints_orientations[v]))
+				th.start()
+
+		print "Finished assigning waypoints"
+
+
+	def set_followers_tf_from_listener(self, parent_ref_frame, child_ref_frame):
+		"""
+		Set transformation and rotation for followers using 'listener' instance
+		"""
+		try:
+			trans, rot = self.listener.lookupTransform(parent_ref_frame, child_ref_frame, rospy.Time(0))
+
+			robotname = child_ref_frame.strip().split('/')[1]
+
+			self.followers_positions[robotname] = trans 
+			self.followers_orientations[robotname] = rot
+
+			# # uncomment to verify the correctness
+			# print "Follower %s Transformation" % child_ref_frame, trans
+			# print "Follower %s Rotation" % child_ref_frame, rot
+
+		except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+			print "Exception has occured", repr(e)
+			pass
+
+	def register_followers(self, request):
+		"""
+		call back for registration_service object
+		 - use 'set_followers_tf_from_listener' method to fetch transformation and rotation
+		 - adds followers to its attribute 'registered_followers'
+		 - if size of 'registered_followers' is equal to expected connections,
+		   proceeds to assigning waypoints for everyone and send goals
+		   To achieve asynchronity, it spawns a thread for assignment behavior 
+		"""
+		if len(request.robotname) > 0:
+			robotname = request.robotname # get 'robotname' from request
+			child_ref_frame = robotname + 'odom' # set the child frame
+
+			print "Get info for child frame:", child_ref_frame
+			
+			self.set_followers_tf_from_listener('world', child_ref_frame)
+			self.registered_followers.add(child_ref_frame)
+
+			if len(self.registered_followers) == self.n - 1:
+				# start a thread
+				print "Starting Assigning Waypoints Thread"
+				th = threading.Thread(target=self.assign_waypoints)
+				th.start()
+				print "Finished Assigning Waypoints Thread"
+
+			return RegistrationServiceResponse(True)
+		else:
+			return RegistrationServiceResponse(False)
+
+	# def publish_all_waypoints(self, positions, orientations):
+	# 	""" This publishes the waypoints as Path message """
+	# 	path_msg = Path()
+	# 	pose_msg = Pose()
+
+	# 	for i in range(self.n):
+	# 		pose = positions[i]
+	# 		orient = orientation[i]
+
+	# 		pose_msg.position.x, pose_msg.position.y, pose_msg.position.z = pose
+	# 		pose_msg.orientation.x, pose_msg.orientation.y, pose_msg.orientation.z, pose_msg.orientation.w = orient
+			
+	# 		path_msg.poses.append(pose_msg)
+
+	# 	self._waypoints.publish(path_msg)
+
+	def stop(self):
+		""" Stop the robot """
+		twist_msg = Twist()
+		self._cmd_pub.publish(twist_msg)
+
+	def _laser_callback(self, msg):
+		"""Processing of laser message."""
+		# Access to the index of the measurement in front of the robot.
+		# NOTE: assumption: the one at angle 0 corresponds to the front.
+		i = int((LASER_ANGLE_FRONT - msg.angle_min) / msg.angle_increment)
+		if msg.ranges[i] <= MIN_THRESHOLD_DISTANCE:
+			self._close_obstacle = True
+		else:
+			self._close_obstacle = False
+
+def main():
+
+	# Initialization of node
+	rospy.init_node("leader")
+
+	# Sleep for couple of seconds to wait for the registration
+	rospy.sleep(5)
+
+	# Publish the initial position of the robot
+	# robotname = str(rospy.get_namespace())
+	# stage_pose = PoseWithCovarianceStamped()
+	# initpose_pub = rospy.Publisher(DEFAULT_INIT_POSE_TOPIC % robotname, PoseWithCovarianceStamped, queue_size=1)
+	# stage_pose.pose.position.x, stage_pose.pose.position.y, stage_pose.pose.position.z = (px, py, pz)
+	# stage_pose.pose.orientation.x, stage_pose.pose.orientation.y, stage_pose.pose.orientation.z, stage_pose.pose.orientation.w = (ox, oy, oz, ow)
+	# initpose_pub.publish(stage_pose)
+
+	# Instance of Leader class
+	leader_obj = Leader()
+
+	# Publish to make followers known that leader has set the waypoints and is now accepting collab
+	leader_obj.set_waypoints()
+	leader_obj.publish_init_coordinate(True)
+
+	# Instance of the service
+	service = rospy.Service('registration_service', RegistrationService, leader_obj.register_followers)
+
+	# If interrupted, send a stop command
+	rospy.on_shutdown(leader_obj.stop)
+
+	try:
+		rospy.spin()
+	except rospy.ROSInterruptException:
+		rospy.logerr("ROS node interrupted")
+
+
+if __name__ == "__main__":
+	roslib.load_manifest('multirobot_shapes')
+	main()
