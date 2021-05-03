@@ -391,6 +391,12 @@ def main():
 	# Instance of Leader class
 	leader_obj = Leader()
 
+
+	print "=================================="
+	print "Sleeping.. "
+	rospy.sleep(5)
+	print "=================================="
+
 	# Publish to make followers known that leader has set the waypoints and is now accepting collab
 	leader_obj.set_waypoints()
 	leader_obj.publish_init_coordinate(True)
